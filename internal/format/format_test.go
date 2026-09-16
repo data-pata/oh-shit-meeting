@@ -137,3 +137,18 @@ func TestDuration_LargeValues(t *testing.T) {
 		t.Errorf("Duration(100 days) = %q, want %q", result, "100d")
 	}
 }
+
+func TestMinutes(t *testing.T) {
+	cases := map[time.Duration]string{
+		0:                               "under a minute",
+		30 * time.Second:                "under a minute",
+		time.Minute:                     "1 minute",
+		-time.Minute:                    "1 minute",
+		12*time.Minute + 59*time.Second: "12 minutes",
+	}
+	for d, want := range cases {
+		if got := Minutes(d); got != want {
+			t.Errorf("Minutes(%v) = %q, want %q", d, got, want)
+		}
+	}
+}

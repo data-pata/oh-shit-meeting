@@ -2,6 +2,7 @@ package gui
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,13 +14,17 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"fyne.io/systray"
 	"github.com/gigurra/oh-shit-meeting/internal/calendar"
+	"github.com/gigurra/oh-shit-meeting/internal/format"
+	"github.com/gigurra/oh-shit-meeting/internal/notify"
 	"github.com/gigurra/oh-shit-meeting/internal/sound"
 )
 
@@ -48,6 +53,8 @@ type Config struct {
 	// ReAuthFn triggers the OAuth2 browser flow. May be nil to disable the
 	// re-auth button and tray menu item.
 	ReAuthFn func() error
+	// NotifyFn sends a desktop toast for soft nudges. Nil means notify.Send.
+	NotifyFn func(title, body string, ttl time.Duration)
 }
 
 // AuthStatus describes the state of stored Google credentials. It's a thin
@@ -120,15 +127,26 @@ type Attendee struct {
 	Organizer      bool
 }
 
+// nudgeState is one soft, non-blocking reminder. It lives until ExpiresAt
+// or until the dashboard dismisses it, whichever comes first.
+type nudgeState struct {
+	ID        string
+	Info      ReminderInfo
+	FiredAt   time.Time
+	ExpiresAt time.Time
+}
+
 var (
 	mu           sync.Mutex
 	active       *ReminderInfo
 	activeDone   chan struct{}
+	nudges       = map[string]*nudgeState{} // protected by mu
 	cfg          Config
 	healthyIcon  []byte
 	authIcon     []byte
 	alertIcon    []byte
 	alertAltIcon []byte
+	nudgeIcon    []byte
 	faviconIcon  = makeIconPNG(trayHealthy)
 	alertActive  bool // protected by mu; true while an alert is flashing
 )
@@ -140,6 +158,7 @@ const (
 	trayAuthAttention
 	trayAlert
 	trayAlertAlternate
+	trayNudge
 )
 
 // Init prepares icons and starts the local HTTP server.
@@ -150,12 +169,14 @@ func Init(c Config) error {
 	authIcon = makeTrayIcon(trayAuthAttention)
 	alertIcon = makeTrayIcon(trayAlert)
 	alertAltIcon = makeTrayIcon(trayAlertAlternate)
+	nudgeIcon = makeTrayIcon(trayNudge)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", guardLocal(handleIndex))
 	mux.HandleFunc("/favicon.png", guardLocal(handleFavicon))
 	mux.HandleFunc("/state", guardLocal(handleState))
 	mux.HandleFunc("/ack", guardLocal(handleAck))
+	mux.HandleFunc("/dismiss-nudge", guardLocal(handleDismissNudge))
 	mux.HandleFunc("/ack-event", guardLocal(handleEventAck))
 	mux.HandleFunc("/unack-event", guardLocal(handleEventUnack))
 	mux.HandleFunc("/ack-reminder", guardLocal(handleReminderAck))
@@ -184,7 +205,7 @@ func Run() {
 }
 
 func onReady() {
-	systray.SetIcon(currentBaseIcon())
+	refreshBaseIcon()
 	systray.SetTitle("")
 	systray.SetTooltip("oh-shit-meeting — " + dashURL())
 
@@ -243,27 +264,25 @@ func runReAuth(source string) {
 	refreshBaseIcon()
 }
 
-// currentBaseIcon picks the tray icon that should be shown when no alert
-// is firing. Amber keyhole when auth needs attention, neutral check otherwise.
-func currentBaseIcon() []byte {
-	if cfg.AuthStatusFn != nil {
-		if cfg.AuthStatusFn().NeedsAttention() {
-			return authIcon
-		}
-	}
-	return healthyIcon
-}
-
-// refreshBaseIcon updates the tray icon to the base (non-flashing) state if
-// no alert is currently flashing. Safe to call from any goroutine.
+// refreshBaseIcon repaints the non-flashing icon, ranked by severity: auth
+// attention, then an active nudge, then healthy. No-op while an alert is
+// flashing. Safe to call from any goroutine. AuthStatusFn may touch the
+// keyring, so it runs before mu is taken.
 func refreshBaseIcon() {
+	authAttention := cfg.AuthStatusFn != nil && cfg.AuthStatusFn().NeedsAttention()
 	mu.Lock()
-	flashing := alertActive
-	mu.Unlock()
-	if flashing {
+	defer mu.Unlock()
+	if alertActive {
 		return
 	}
-	systray.SetIcon(currentBaseIcon())
+	switch {
+	case authAttention:
+		systray.SetIcon(authIcon)
+	case len(nudges) > 0:
+		systray.SetIcon(nudgeIcon)
+	default:
+		systray.SetIcon(healthyIcon)
+	}
 }
 
 func dashURL() string {
@@ -297,6 +316,113 @@ func ShowPopupBlocking(info ReminderInfo) {
 	time.Sleep(100 * time.Millisecond)
 }
 
+// ShowNudge raises a soft reminder (toast, blue tray icon, dashboard
+// banner) that clears itself after ttl. Repeat IDs are ignored while live.
+func ShowNudge(id string, info ReminderInfo, ttl time.Duration) {
+	now := time.Now()
+	mu.Lock()
+	if _, live := nudges[id]; live {
+		mu.Unlock()
+		return
+	}
+	nudges[id] = &nudgeState{ID: id, Info: info, FiredAt: now, ExpiresAt: now.Add(ttl)}
+	mu.Unlock()
+	refreshBaseIcon()
+
+	sendToast := cfg.NotifyFn
+	if sendToast == nil {
+		sendToast = notify.Send
+	}
+	// Synchronous: the caller writes the ack that suppresses this nudge as
+	// soon as we return, so delivery must have been attempted by then.
+	sendToast(nudgeTitle(info), nudgeBody(info, now), ttl)
+
+	time.AfterFunc(ttl, func() {
+		if expireNudges(time.Now()) > 0 {
+			refreshBaseIcon()
+		}
+	})
+}
+
+// expireNudges drops every nudge whose deadline has passed and reports how
+// many were dropped.
+func expireNudges(now time.Time) int {
+	mu.Lock()
+	defer mu.Unlock()
+	dropped := 0
+	for id, n := range nudges {
+		if !now.Before(n.ExpiresAt) {
+			delete(nudges, id)
+			dropped++
+		}
+	}
+	return dropped
+}
+
+// clearNudges drops every live nudge and reports how many went. Nudges only
+// ever exist for unanswered invites, so this is exactly the set the
+// unanswered-invitations preference governs.
+func clearNudges() int {
+	mu.Lock()
+	defer mu.Unlock()
+	n := len(nudges)
+	clear(nudges)
+	return n
+}
+
+// dismissNudge removes the nudge with the given ID. False when absent.
+func dismissNudge(id string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := nudges[id]; !ok {
+		return false
+	}
+	delete(nudges, id)
+	return true
+}
+
+// sortedNudgesLocked returns the live nudges ordered by event start time.
+// Caller must hold mu, and must not retain the pointers past unlocking.
+func sortedNudgesLocked() []*nudgeState {
+	out := make([]*nudgeState, 0, len(nudges))
+	for _, n := range nudges {
+		out = append(out, n)
+	}
+	slices.SortFunc(out, func(a, b *nudgeState) int {
+		return cmp.Or(a.Info.StartTime.Compare(b.Info.StartTime), strings.Compare(a.ID, b.ID))
+	})
+	return out
+}
+
+// toastLimit bounds toast text in runes. Summaries come from invite senders.
+const toastLimit = 200
+
+func nudgeTitle(info ReminderInfo) string {
+	if info.Summary == "" {
+		return "Unanswered invite"
+	}
+	return truncate("Unanswered invite: "+info.Summary, toastLimit)
+}
+
+func nudgeBody(info ReminderInfo, now time.Time) string {
+	until := info.StartTime.Sub(now)
+	var when string
+	if until < 0 {
+		when = fmt.Sprintf("started %s ago", format.Minutes(-until))
+	} else {
+		when = fmt.Sprintf("starts in %s", format.Minutes(until))
+	}
+	return fmt.Sprintf("%s (%s). You have not replied to this invite.",
+		when, info.StartTime.Local().Format("15:04"))
+}
+
+func truncate(s string, limit int) string {
+	if utf8.RuneCountInString(s) <= limit {
+		return s
+	}
+	return string([]rune(s)[:limit]) + "…"
+}
+
 func flashTray(done <-chan struct{}) {
 	mu.Lock()
 	alertActive = true
@@ -311,7 +437,7 @@ func flashTray(done <-chan struct{}) {
 			mu.Lock()
 			alertActive = false
 			mu.Unlock()
-			systray.SetIcon(currentBaseIcon())
+			refreshBaseIcon()
 			return
 		case <-ticker.C:
 			if alternate {
@@ -342,6 +468,21 @@ type alertDTO struct {
 	Attendees      []attendeeDTO `json:"attendees,omitempty"`
 }
 
+type nudgeDTO struct {
+	ID             string    `json:"id"`
+	Summary        string    `json:"summary"`
+	StartTime      time.Time `json:"startTime"`
+	ReminderID     string    `json:"reminderId"`
+	Calendar       string    `json:"calendar,omitempty"`
+	Location       string    `json:"location,omitempty"`
+	OrganizerName  string    `json:"organizerName,omitempty"`
+	OrganizerEmail string    `json:"organizerEmail,omitempty"`
+	HangoutLink    string    `json:"hangoutLink,omitempty"`
+	HtmlLink       string    `json:"htmlLink,omitempty"`
+	FiredAt        time.Time `json:"firedAt"`
+	ExpiresAt      time.Time `json:"expiresAt"`
+}
+
 type eventDTO struct {
 	ID               string        `json:"id"`
 	Summary          string        `json:"summary"`
@@ -358,7 +499,10 @@ type eventDTO struct {
 	Acked            bool          `json:"acked,omitempty"`
 	Declined         bool          `json:"declined,omitempty"`
 	AwaitingResponse bool          `json:"awaitingResponse,omitempty"`
-	Reminders        []reminderDTO `json:"reminders,omitempty"`
+	// SelfResponse carries the raw RSVP so the dashboard can show tentative,
+	// which the booleans above cannot express.
+	SelfResponse string        `json:"selfResponse,omitempty"`
+	Reminders    []reminderDTO `json:"reminders,omitempty"`
 }
 
 type reminderDTO struct {
@@ -377,6 +521,7 @@ type attendeeDTO struct {
 
 type stateDTO struct {
 	Alert       *alertDTO       `json:"alert,omitempty"`
+	Nudges      []nudgeDTO      `json:"nudges"`
 	Previous    []eventDTO      `json:"previous"`
 	Upcoming    []eventDTO      `json:"upcoming"`
 	Now         time.Time       `json:"now"`
@@ -487,11 +632,29 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 			Attendees:      attendees,
 		}
 	}
+	nds := make([]nudgeDTO, 0, len(nudges))
+	for _, n := range sortedNudgesLocked() {
+		nds = append(nds, nudgeDTO{
+			ID:             n.ID,
+			Summary:        n.Info.Summary,
+			StartTime:      n.Info.StartTime,
+			ReminderID:     n.Info.ReminderID,
+			Calendar:       n.Info.Calendar,
+			Location:       n.Info.Location,
+			OrganizerName:  n.Info.OrganizerName,
+			OrganizerEmail: n.Info.OrganizerEmail,
+			HangoutLink:    n.Info.HangoutLink,
+			HtmlLink:       n.Info.HtmlLink,
+			FiredAt:        n.FiredAt,
+			ExpiresAt:      n.ExpiresAt,
+		})
+	}
 	mu.Unlock()
 
 	previous, upcoming := visibleEvents()
 	resp := stateDTO{
 		Alert:       al,
+		Nudges:      nds,
 		Previous:    previous,
 		Upcoming:    upcoming,
 		Now:         time.Now(),
@@ -551,6 +714,11 @@ func handleAlertUnansweredPreference(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to save preference", http.StatusInternalServerError)
 		return
 	}
+	// An in-flight hard alert is deliberately left alone: it has already
+	// interrupted the user, and handleAck is its only exit.
+	if !enabled && clearNudges() > 0 {
+		refreshBaseIcon()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -586,14 +754,24 @@ func handleReAuth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func handleAck(w http.ResponseWriter, r *http.Request) {
+// postID enforces POST and a non-empty id query parameter, writing the
+// error response itself when either is missing.
+func postID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
+		return "", false
 	}
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
+		return "", false
+	}
+	return id, true
+}
+
+func handleAck(w http.ResponseWriter, r *http.Request) {
+	id, ok := postID(w, r)
+	if !ok {
 		return
 	}
 	mu.Lock()
@@ -608,6 +786,19 @@ func handleAck(w http.ResponseWriter, r *http.Request) {
 	}
 	close(activeDone)
 	activeDone = nil
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleDismissNudge(w http.ResponseWriter, r *http.Request) {
+	id, ok := postID(w, r)
+	if !ok {
+		return
+	}
+	if !dismissNudge(id) {
+		http.Error(w, "no matching nudge", http.StatusConflict)
+		return
+	}
+	refreshBaseIcon()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -753,6 +944,7 @@ func toEventDTO(e calendar.Event, st time.Time) eventDTO {
 			Organizer:      a.Organizer,
 		})
 	}
+	selfResponse, _ := e.SelfResponseStatus()
 	return eventDTO{
 		ID:               e.ID,
 		Summary:          e.Summary,
@@ -768,6 +960,7 @@ func toEventDTO(e calendar.Event, st time.Time) eventDTO {
 		Status:           e.Status,
 		Declined:         e.IsDeclinedBySelf(),
 		AwaitingResponse: e.IsAwaitingSelfResponse(),
+		SelfResponse:     selfResponse,
 	}
 }
 
@@ -802,6 +995,7 @@ func makeIconPNG(state trayIconState) []byte {
 	graphite := color.RGBA{R: 55, G: 65, B: 81, A: 255}
 	amber := color.RGBA{R: 217, G: 154, B: 0, A: 255}
 	red := color.RGBA{R: 217, G: 45, B: 32, A: 255}
+	blue := color.RGBA{R: 26, G: 115, B: 232, A: 255}
 
 	switch state {
 	case trayHealthy:
@@ -820,6 +1014,9 @@ func makeIconPNG(state trayIconState) []byte {
 		drawCircle(img, 11, 11, 10, red)
 		drawSmallCalendar(img, white)
 		drawSmallExclamation(img, red)
+	case trayNudge:
+		drawCalendar(img, 3, 2, blue)
+		drawQuestion(img, white)
 	}
 
 	var buf bytes.Buffer
@@ -885,6 +1082,14 @@ func drawKeyhole(img *image.RGBA, c color.RGBA) {
 func drawExclamation(img *image.RGBA, c color.RGBA) {
 	fillRect(img, 10, 9, 13, 15, c)
 	fillRect(img, 10, 17, 13, 19, c)
+}
+
+func drawQuestion(img *image.RGBA, c color.RGBA) {
+	fillRect(img, 8, 8, 14, 10, c)   // top bar
+	fillRect(img, 12, 10, 14, 12, c) // right side
+	fillRect(img, 10, 12, 14, 14, c) // hook
+	fillRect(img, 10, 14, 12, 15, c) // stem
+	fillRect(img, 10, 17, 12, 19, c) // dot
 }
 
 func drawSmallExclamation(img *image.RGBA, c color.RGBA) {
@@ -960,6 +1165,45 @@ const indexHTML = `<!doctype html>
     padding-left: 0.5rem;
     font-size: 0.85rem;
   }
+  .rsvp-badge {
+    font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.5rem; margin-left: 0.5rem;
+    border-radius: 999px; vertical-align: middle; border: 1px solid currentColor;
+  }
+  .rsvp-badge.declined { color: #8a8a8a; }
+  .rsvp-badge.needsAction { color: #1a73e8; }
+  .rsvp-badge.tentative { color: #b08a2c; }
+  .event.declined > summary .title { text-decoration: line-through; opacity: 0.5; }
+  .event.declined > summary { opacity: 0.7; }
+
+  /* Nudge banners: calm blue, no flashing, self-dismissing. */
+  .nudge {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 1rem;
+    padding: 0.9rem 1.2rem; margin-bottom: 1rem;
+    border-radius: 0.6rem; border: 1px solid #1a73e8;
+    background: #e8f0fe; color: #174ea6;
+    animation: nudge-in 0.4s ease-out;
+  }
+  .nudge .text { flex: 1 1 18rem; }
+  .nudge .text strong { font-size: 1.05rem; }
+  .nudge .meta { font-size: 0.85rem; opacity: 0.85; margin-top: 0.15rem; }
+  .nudge .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .nudge .actions a, .nudge .actions button {
+    font-size: 0.85rem; padding: 0.35rem 0.8rem; border-radius: 0.4rem;
+    border: 1px solid #1a73e8; background: transparent; color: #174ea6;
+    cursor: pointer; text-decoration: none;
+  }
+  .nudge .actions a.primary { background: #1a73e8; color: white; }
+  .nudge .fuse {
+    flex-basis: 100%; height: 3px; background: #1a73e833; border-radius: 2px; overflow: hidden;
+  }
+  .nudge .fuse > div { height: 100%; background: #1a73e8; transition: width 1s linear; }
+  @media (prefers-color-scheme: dark) {
+    .nudge { background: #10233f; color: #cfe0ff; border-color: #4a8df8; }
+    .nudge .actions a, .nudge .actions button { color: #cfe0ff; border-color: #4a8df8; }
+    .nudge .actions a.primary { background: #4a8df8; color: #0b1a30; }
+  }
+  @keyframes nudge-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
   .ack-badge {
     display: inline-block; margin-left: 0.4rem; padding: 0.05rem 0.45rem;
     background: #1a7f1a; color: white; border-radius: 999px;
@@ -1245,7 +1489,7 @@ function renderAckActions(e) {
 
 function eventKey(e) {
   const remKey = (e.reminders || []).map(r => r.id + (r.acked ? "1" : "0")).join(",");
-  return (e.id || "") + "|" + (e.summary || "") + "|" + (e.startTime || "") + "|" + (e.hangoutLink || "") + "|" + ((e.attendees || []).length) + "|" + (e.description || "").length + "|" + (e.location || "") + "|" + (e.acked ? "1" : "0") + "|" + (e.declined ? "1" : "0") + "|" + (e.awaitingResponse ? "1" : "0") + "|" + remKey;
+  return (e.id || "") + "|" + (e.summary || "") + "|" + (e.startTime || "") + "|" + (e.hangoutLink || "") + "|" + ((e.attendees || []).length) + "|" + (e.description || "").length + "|" + (e.location || "") + "|" + (e.acked ? "1" : "0") + "|" + (e.declined ? "1" : "0") + "|" + (e.awaitingResponse ? "1" : "0") + "|" + (e.selfResponse || "") + "|" + remKey;
 }
 
 function renderEventListItem(e, now) {
@@ -1258,16 +1502,82 @@ function renderEventListItem(e, now) {
   if (e.declined) html += ' <span class="declined-badge">× DECLINED</span>';
   else if (e.acked) html += ' <span class="ack-badge">✓ ACKED</span>';
   else if (e.awaitingResponse) html += ' <span class="awaiting-badge">AWAITING RESPONSE</span>';
+  else html += renderRsvpBadge(e.selfResponse);
   html += '<div class="meta">';
-  html += '<span class="countdown">' + fmtDateTime(start) + ' — ' + relPhrase(start.getTime(), now) + '</span>';
-  if (e.calendar)  html += ' · 📅 ' + escapeHtml(e.calendar);
-  if (e.organizer) html += ' · ' + escapeHtml(e.organizer);
-  if (e.location)  html += ' · ' + escapeHtml(e.location);
+  html += '<span class="countdown">' + fmtDateTime(start) + ' — ' + relPhrase(start.getTime(), now) + '</span>' + metaChain(e);
   html += '</div>';
   html += '</summary>';
   html += renderEventBody(e);
   html += '</details></li>';
   return html;
+}
+
+function renderRsvpBadge(rs) {
+  if (rs === 'tentative') return ' <span class="rsvp-badge tentative" title="You answered maybe. Alerts as normal.">maybe</span>';
+  return '';
+}
+
+function nudgesKey(list) {
+  return (list || []).map(n => n.id + "|" + (n.summary || "") + "|" + (n.startTime || "") + "|" + (n.expiresAt || "")).join(";;");
+}
+
+function metaChain(e) {
+  let html = '';
+  const organizer = e.organizer || e.organizerName || e.organizerEmail;
+  if (e.calendar)  html += ' · 📅 ' + escapeHtml(e.calendar);
+  if (organizer)   html += ' · ' + escapeHtml(organizer);
+  if (e.location)  html += ' · ' + escapeHtml(e.location);
+  return html;
+}
+
+function renderNudges(list) {
+  let html = '';
+  for (const n of (list || [])) {
+    html += '<div class="nudge" data-nudge-id="' + escapeAttr(n.id) + '">';
+    html += '<div class="text"><strong>Unanswered invite: ' + escapeHtml(n.summary || "(no title)") + '</strong>';
+    html += '<div class="meta"><span class="nudge-when"></span>' + metaChain(n) + '</div>';
+    html += '<div class="meta">You never replied, so this is a nudge, not an alarm. It goes away by itself in <span class="nudge-left"></span>.</div>';
+    html += '</div>';
+    html += '<div class="actions">';
+    if (n.hangoutLink) html += '<a class="primary" href="' + escapeAttr(n.hangoutLink) + '" target="_blank" rel="noopener">📹 Join</a>';
+    if (n.htmlLink)    html += '<a href="' + escapeAttr(n.htmlLink) + '" target="_blank" rel="noopener">Respond in Calendar ↗</a>';
+    html += '<button class="nudge-dismiss" data-nudge-id="' + escapeAttr(n.id) + '">Dismiss</button>';
+    html += '</div>';
+    html += '<div class="fuse"><div class="nudge-fuse" style="width:100%"></div></div>';
+    html += '</div>';
+  }
+  return html;
+}
+
+function updateNudgeCountdowns(list, nowMs) {
+  for (const n of (list || [])) {
+    const el = root.querySelector('.nudge[data-nudge-id="' + CSS.escape(n.id) + '"]');
+    if (!el) continue;
+    const fired = new Date(n.firedAt).getTime();
+    const expires = new Date(n.expiresAt).getTime();
+    const left = Math.max(0, expires - nowMs);
+    const leftEl = el.querySelector(".nudge-left");
+    const fuse = el.querySelector(".nudge-fuse");
+    const when = el.querySelector(".nudge-when");
+    if (leftEl) leftEl.textContent = fmtDuration(left);
+    if (fuse && expires > fired) fuse.style.width = Math.round(100 * left / (expires - fired)) + "%";
+    if (when) {
+      const start = new Date(n.startTime);
+      when.textContent = fmtDateTime(start) + ' — ' + relPhrase(start.getTime(), nowMs);
+    }
+  }
+}
+
+function bindNudgeButtons() {
+  root.querySelectorAll(".nudge-dismiss").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      try {
+        await fetch("/dismiss-nudge?id=" + encodeURIComponent(btn.dataset.nudgeId), { method: "POST" });
+      } catch (e) { /* ignore */ }
+      lastRendered = "";
+      tick();
+    });
+  });
 }
 
 function authStatusKey(auth) {
@@ -1433,11 +1743,12 @@ function renderDashboard(state) {
   const previous = state.previous || [];
   const upcoming = state.upcoming || [];
   const now = new Date(state.now).getTime();
-  const key = "dash:" + authStatusKey(state.auth) + "::" + JSON.stringify(state.fetch) + "::" + JSON.stringify(state.preferences) + "::"
+  const key = "dash:" + authStatusKey(state.auth) + "::" + JSON.stringify(state.fetch) + "::" + JSON.stringify(state.preferences) + "::" + nudgesKey(state.nudges) + "::"
     + previous.map(eventKey).join(";;") + "::" + upcoming.map(eventKey).join(";;");
   if (key !== lastRendered) {
     let html = '<div class="dashboard">';
     html += renderFetchBlock(state.fetch, state.auth, now, state.preferences);
+    html += renderNudges(state.nudges);
     html += '<h1>oh-shit-meeting <span class="status">running</span></h1>';
 
     if (previous.length > 0) {
@@ -1464,12 +1775,15 @@ function renderDashboard(state) {
     bindReAuthButton();
     bindFetchButton();
     bindAlertUnansweredPreference();
+    bindNudgeButtons();
+    updateNudgeCountdowns(state.nudges, now);
   } else {
     // live-update countdowns without collapsing any open accordion. The auth
     // countdown lives in #reauthCountdown so we update it separately and skip
     // it when iterating event countdowns.
     updateAuthCountdown(state.auth, now);
     root.querySelectorAll("[data-fetch-time]").forEach(el => { el.textContent = fetchTime(el.dataset.fetchTime, now); });
+    updateNudgeCountdowns(state.nudges, now);
     const spans = Array.from(root.querySelectorAll(".countdown")).filter(s => s.id !== "reauthCountdown");
     const all = previous.concat(upcoming);
     all.forEach((e, i) => {

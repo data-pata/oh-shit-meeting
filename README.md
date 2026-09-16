@@ -14,6 +14,7 @@ A calendar reminder daemon that makes sure you never miss a meeting. Serves a lo
 - **Custom reminder support** — respects your calendar's reminder settings (30m, 2h, etc.)
 - **Response-aware alerts** — meetings you declined are shown as handled and never alert; unanswered invitations can be included or silenced from a persistent dashboard preference
 - **Global fallback reminder** — configurable default reminder for all events
+- **RSVP-aware**: declined invites never alert. Invites you have not answered get a soft nudge instead of the full panic: a native desktop toast, a blue question-mark tray icon, and a calm banner on the dashboard that clears itself after `--nudge-duration` (no sound, no browser focus, nothing to acknowledge). Nudges stack when several invites are due. Switch with `--unanswered=alert|ignore`. The dashboard preference for unanswered invitations is the master switch: with it off, unanswered invites stay silent whatever `--unanswered` says. Needs the backend to report your own RSVP, which the `google` and `gws` backends do
 - **Non-blocking polling** — calendar polling runs in a background goroutine with timeouts, so alerts always fire on time even if the API is slow
 - **Cross-platform audio** — macOS system sounds; generated tones on Linux/Windows (experimental, untested)
 - **Deduplication** — each reminder only fires once per event instance (persisted to disk, auto-cleaned after 7 days)
@@ -141,6 +142,8 @@ oh-shit-meeting &; disown
 | `--calendar` | last auth's selection | Comma-separated calendar IDs to read (`primary` for your own, `all` for every subscribed calendar). Also narrows the OAuth scope, so pass it to `auth` too. Honoured by the `google` and `gws` backends |
 | `--port` | `47448` | Port for the local dashboard HTTP server (4SHIT on a phone keypad) |
 | `--display-test-alert` | `false` | Fire a synthetic alert and exit when acknowledged |
+| `--unanswered` | `soft` | Invites without an RSVP: `soft` (toast + self-dismissing dashboard nudge), `alert` (full panic), `ignore` (silent). Only consulted when the dashboard preference allows unanswered invitations through |
+| `--nudge-duration` | `2m` | How long a soft nudge stays visible before it clears itself |
 | `--accept-insecure-secret-storage` | `false` | Allow plaintext JSON fallback when the system keychain is unavailable (available on every subcommand) |
 
 ## How It Works
@@ -149,6 +152,7 @@ oh-shit-meeting &; disown
 2. Polls Google Calendar in a **background goroutine** every poll interval (with 30s timeout per API call), and requests an immediate poll whenever the dashboard is loaded or refreshed, the fetch button is clicked, or re-authentication succeeds
 3. Checks reminders **every second** against cached events (never blocked by polling)
 4. For each upcoming event, checks:
+   - Your RSVP: declined events are skipped entirely, unanswered invites are routed to the soft path (see below), accepted and tentative events get the full alert
    - Custom reminder overrides (popup reminders only)
    - Global `--warn-before` threshold
 5. When a reminder triggers:
@@ -158,9 +162,16 @@ oh-shit-meeting &; disown
    - Flashes the tray icon between two distinct red alert frames
    - Plays the alert sound on loop
 6. Click ACKNOWLEDGE (the big white button on the panic page) to dismiss
-7. Stale ack files are cleaned up automatically after 7 days
+7. When a reminder triggers for an invite you have not answered (`--unanswered=soft`, the default):
+   - Sends a native desktop toast (`notify-send` on Linux, `osascript` on macOS, a PowerShell balloon on Windows), then writes the ack that suppresses it, in that order, so a failed delivery is not recorded as delivered
+   - Nudges once per invite occurrence, however many reminder thresholds it passes. Each threshold still acks under its own `nudge-` prefix, so the hard alert stays armed if you accept the invite later
+   - Swaps the tray icon to a blue question mark and shows a blue banner on the dashboard with Join / Respond in Calendar / Dismiss
+   - Clears itself after `--nudge-duration`. Nothing blocks, nothing loops, and a real alert for another meeting still fires on top of it
+   - Turning the unanswered-invitations preference off clears live nudges at once. An alert already on screen is left running, because it has already interrupted you, and ACKNOWLEDGE is its only exit
+   - The tray icon only shows the question mark when auth is healthy. Auth attention always wins
+8. Stale ack files are cleaned up automatically after 7 days
 
-The dashboard endpoints (`/`, `/state`, `/ack`) are bound to loopback only, reject requests with non-loopback `Host` headers (DNS-rebinding defence), and require a same-origin `Origin` on unsafe methods. ACK requires the exact reminder ID of the currently active alert.
+The dashboard endpoints (`/`, `/state`, `/ack`, `/dismiss-nudge`) are bound to loopback only, reject requests with non-loopback `Host` headers (DNS-rebinding defence), and require a same-origin `Origin` on unsafe methods. ACK requires the exact reminder ID of the currently active alert.
 
 ## Running as a Background Service
 

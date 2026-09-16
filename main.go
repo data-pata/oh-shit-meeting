@@ -43,6 +43,8 @@ type Params struct {
 	Port             int           `descr:"Port for the local dashboard HTTP server" default:"47448"`
 	DisplayTestAlert bool          `descr:"Fire a synthetic alert and exit when acknowledged (for testing)" default:"false"`
 	Calendar         string        `descr:"Comma-separated calendar IDs to read ('primary' for your own, 'all' for every subscribed calendar). Defaults to the selection from the last auth" default:""`
+	Unanswered       string        `descr:"How to treat invites you have not replied to: soft (desktop toast plus a self-dismissing dashboard nudge), alert (full panic alert), ignore (silence)" default:"soft" alts:"soft,alert,ignore"`
+	NudgeDuration    time.Duration `descr:"How long a soft nudge stays visible before it clears itself" default:"2m"`
 }
 
 type ListEventsParams struct {
@@ -258,6 +260,11 @@ func run(params *Params) {
 		return
 	}
 
+	if params.NudgeDuration <= 0 {
+		slog.Error("--nudge-duration must be positive", "value", params.NudgeDuration)
+		os.Exit(1)
+	}
+
 	lockPath := filepath.Join(os.TempDir(), "oh-shit-meeting.lock")
 	fileLock := flock.New(lockPath)
 
@@ -310,6 +317,7 @@ func run(params *Params) {
 	finder := reminder.NewFinder(ackStore, &reminder.RealClock{}, reminder.Config{
 		WarnBefore:                 params.WarnBefore,
 		Sound:                      params.Sound,
+		Unanswered:                 reminder.UnansweredMode(params.Unanswered),
 		AlertUnansweredInvitations: preferenceStore.AlertUnansweredInvitations,
 	})
 	if err := gui.Init(gui.Config{
@@ -343,19 +351,11 @@ func run(params *Params) {
 			return out
 		},
 		AckReminderFn: func(eventID string, startTime time.Time, reminderID string) error {
-			ackKey := reminder.AckEventKey(eventID, startTime)
-			if err := ackStore.MarkAcked(ackKey, reminderID); err != nil {
-				return err
+			event, ok := findEvent(store.get(), eventID, startTime)
+			if !ok {
+				return ackStore.MarkAcked(reminder.AckEventKey(eventID, startTime), reminderID)
 			}
-			// Mirror runLoop: promote to event-level when fully covered.
-			if event, ok := findEvent(store.get(), eventID, startTime); ok {
-				if finder.IsFullyAcked(event, startTime) {
-					if err := ackStore.MarkAcked(ackKey, reminder.EventAckID); err != nil {
-						slog.Error("Failed to promote to event ack", "error", err)
-					}
-				}
-			}
-			return nil
+			return finder.RecordAck(event, startTime, reminderID)
 		},
 		UnackReminderFn: func(eventID string, startTime time.Time, reminderID string) error {
 			ackKey := reminder.AckEventKey(eventID, startTime)
@@ -370,7 +370,7 @@ func run(params *Params) {
 		slog.Error("failed to init dashboard", "error", err)
 		os.Exit(1)
 	}
-	go runLoop(params, store, ackStore, finder, pollNow)
+	go runLoop(params, store, finder, pollNow)
 	gui.Run()
 }
 
@@ -524,7 +524,7 @@ func (s *eventStore) poll(reason string, poll func() calendar.PollResult) {
 	s.fetch.LastSuccessAt = result.CompletedAt
 }
 
-func runLoop(params *Params, store *eventStore, ackStore *ack.FileStore, finder *reminder.Finder, pollNow <-chan string) {
+func runLoop(params *Params, store *eventStore, finder *reminder.Finder, pollNow <-chan string) {
 	// Poll calendar in a separate goroutine so slow/hung API calls
 	// never block the alert check loop.
 	go pollEvents(params.PollInterval, pollNow, nil, store, func() calendar.PollResult {
@@ -540,59 +540,70 @@ func runLoop(params *Params, store *eventStore, ackStore *ack.FileStore, finder 
 		evts := store.get()
 
 		info := finder.FindNext(evts)
-		if info != nil {
-			slog.Warn("MEETING STARTING SOON",
-				"event", info.Event.Summary,
-				"startsIn", format.Duration(info.TimeUntil),
-				"startTime", info.StartTime.Local().Format("15:04"),
-				"location", info.Event.Location,
-				"source", info.ReminderID,
-			)
-
-			var endTime time.Time
-			if info.Event.End.DateTime != "" {
-				endTime, _ = time.Parse(time.RFC3339, info.Event.End.DateTime)
-			}
-			attendees := make([]gui.Attendee, 0, len(info.Event.Attendees))
-			for _, a := range info.Event.Attendees {
-				attendees = append(attendees, gui.Attendee{
-					Email:          a.Email,
-					DisplayName:    a.DisplayName,
-					ResponseStatus: a.ResponseStatus,
-					Self:           a.Self,
-					Organizer:      a.Organizer,
-				})
-			}
-			gui.ShowPopupBlocking(gui.ReminderInfo{
-				Summary:        info.Event.Summary,
-				StartTime:      info.StartTime,
-				EndTime:        endTime,
-				TimeUntil:      info.TimeUntil,
-				ReminderID:     info.ReminderID,
-				Sound:          info.Sound,
-				Location:       info.Event.Location,
-				OrganizerName:  info.Event.Organizer.DisplayName,
-				OrganizerEmail: info.Event.Organizer.Email,
-				Fullscreen:     params.Fullscreen,
-				Calendar:       info.Event.Calendar,
-				Description:    info.Event.Description,
-				HangoutLink:    info.Event.HangoutLink,
-				HtmlLink:       info.Event.HtmlLink,
-				Attendees:      attendees,
-			})
-
-			if err := ackStore.MarkAcked(info.AckEventKey, info.ReminderID); err != nil {
-				slog.Error("Failed to mark reminder as acknowledged", "error", err)
-			}
-			// If every alert that could fire for this event is now acked,
-			// promote to an event-level ack so the dashboard reflects the
-			// fully-handled state.
-			if finder.IsFullyAcked(info.Event, info.StartTime) {
-				if err := ackStore.MarkAcked(info.AckEventKey, reminder.EventAckID); err != nil {
-					slog.Error("Failed to promote to event ack", "error", err)
-				}
-			}
+		if info == nil {
+			continue
 		}
+		attrs := []any{
+			"event", info.Event.Summary,
+			"startsIn", format.Duration(info.TimeUntil),
+			"startTime", info.StartTime.Local().Format("15:04"),
+			"location", info.Event.Location,
+			"source", info.ReminderID,
+		}
+		if info.Soft {
+			slog.Info("UNANSWERED INVITE STARTING SOON", attrs...)
+		} else {
+			slog.Warn("MEETING STARTING SOON", attrs...)
+		}
+
+		display := toReminderInfo(info, params.Fullscreen)
+		if info.Soft {
+			// Keyed by occurrence, not by reminder, so one invite nudges once
+			// however many thresholds it passes.
+			gui.ShowNudge(info.AckEventKey, display, params.NudgeDuration)
+		} else {
+			gui.ShowPopupBlocking(display)
+		}
+		// Written only once delivery has been attempted: the ack is what
+		// suppresses the reminder, so it must not outlive a failed delivery.
+		if err := finder.RecordAck(info.Event, info.StartTime, info.AckID); err != nil {
+			slog.Error("Failed to mark reminder as acknowledged", "error", err)
+		}
+	}
+}
+
+// toReminderInfo maps a found reminder onto the gui's display DTO.
+func toReminderInfo(info *reminder.Info, fullscreen bool) gui.ReminderInfo {
+	var endTime time.Time
+	if info.Event.End.DateTime != "" {
+		endTime, _ = time.Parse(time.RFC3339, info.Event.End.DateTime)
+	}
+	attendees := make([]gui.Attendee, 0, len(info.Event.Attendees))
+	for _, a := range info.Event.Attendees {
+		attendees = append(attendees, gui.Attendee{
+			Email:          a.Email,
+			DisplayName:    a.DisplayName,
+			ResponseStatus: a.ResponseStatus,
+			Self:           a.Self,
+			Organizer:      a.Organizer,
+		})
+	}
+	return gui.ReminderInfo{
+		Summary:        info.Event.Summary,
+		StartTime:      info.StartTime,
+		EndTime:        endTime,
+		TimeUntil:      info.TimeUntil,
+		ReminderID:     info.ReminderID,
+		Sound:          info.Sound,
+		Location:       info.Event.Location,
+		OrganizerName:  info.Event.Organizer.DisplayName,
+		OrganizerEmail: info.Event.Organizer.Email,
+		Fullscreen:     fullscreen,
+		Calendar:       info.Event.Calendar,
+		Description:    info.Event.Description,
+		HangoutLink:    info.Event.HangoutLink,
+		HtmlLink:       info.Event.HtmlLink,
+		Attendees:      attendees,
 	}
 }
 

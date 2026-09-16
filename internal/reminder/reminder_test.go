@@ -724,8 +724,8 @@ func TestFindNext_UnansweredPreference(t *testing.T) {
 		WarnBefore:                 5 * time.Minute,
 		AlertUnansweredInvitations: func() bool { return enabled },
 	})
-	if got := finder.FindNext([]calendar.Event{event}); got == nil {
-		t.Fatal("unanswered meeting should alert while preference is enabled")
+	if got := finder.FindNext([]calendar.Event{event}); got == nil || !got.Soft {
+		t.Fatalf("unanswered meeting should nudge while preference is enabled, got %+v", got)
 	}
 	enabled = false
 	if got := finder.FindNext([]calendar.Event{event}); got != nil {
@@ -1081,5 +1081,205 @@ func TestFindNext_NoAckShouldStillShowStarted(t *testing.T) {
 	}
 	if result.ReminderID != "started" {
 		t.Errorf("expected started reminder, got %s", result.ReminderID)
+	}
+}
+
+func withSelf(event calendar.Event, response string) calendar.Event {
+	event.Attendees = []calendar.Attendee{
+		{Email: "organizer@example.com", Organizer: true, ResponseStatus: calendar.ResponseAccepted},
+		{Email: "me@example.com", Self: true, ResponseStatus: response},
+	}
+	return event
+}
+
+func TestFindNext_DeclinedEventNeverFires(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	clock := &mockClock{now: now}
+	ackStore := newMockAckStore()
+	finder := NewFinder(ackStore, clock, Config{WarnBefore: 5 * time.Minute})
+
+	// In the warn window, already started, and with a custom override: none fire.
+	events := []calendar.Event{
+		withSelf(makeEventWithReminders("started", "Started", now.Add(-2*time.Minute), now.Add(30*time.Minute), 10), calendar.ResponseDeclined),
+		withSelf(makeEvent("soon", "Soon", now.Add(3*time.Minute), now.Add(33*time.Minute)), calendar.ResponseDeclined),
+	}
+	if info := finder.FindNext(events); info != nil {
+		t.Fatalf("expected no reminder for declined events, got %q", info.ReminderID)
+	}
+	if rs := finder.Reminders(events[1], now.Add(3*time.Minute)); len(rs) != 0 {
+		t.Fatalf("expected no reminder states for declined event, got %d", len(rs))
+	}
+}
+
+func TestFindNext_NudgeAckDoesNotDisarmHardAlert(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	clock := &mockClock{now: now}
+	ackStore := newMockAckStore()
+	finder := NewFinder(ackStore, clock, Config{WarnBefore: 5 * time.Minute})
+	start := now.Add(4 * time.Minute)
+	invite := withSelf(makeEvent("inv", "Invite", start, start.Add(30*time.Minute)), calendar.ResponseNeedsAction)
+
+	// The nudge fires and is recorded under its own namespace.
+	info := finder.FindNext([]calendar.Event{invite})
+	if info == nil || !info.Soft || info.AckID != nudgePrefix+"global" {
+		t.Fatalf("expected soft global reminder, got %+v", info)
+	}
+	if err := finder.RecordAck(invite, start, info.AckID); err != nil {
+		t.Fatal(err)
+	}
+	if finder.FindNext([]calendar.Event{invite}) != nil {
+		t.Fatal("nudge should fire only once per threshold")
+	}
+	if !finder.IsFullyAcked(invite, start) {
+		t.Fatal("all nudges for the invite were shown, expected fully acked in the nudge namespace")
+	}
+	if ackStore.IsAcked(info.AckEventKey, EventAckID) {
+		t.Fatal("a nudge must never promote to an event-level ack")
+	}
+
+	// The user accepts the invite: the hard alert must still fire.
+	accepted := withSelf(invite, calendar.ResponseAccepted)
+	if finder.IsFullyAcked(accepted, start) {
+		t.Fatal("nudge ack must not count as a hard-alert ack")
+	}
+	info = finder.FindNext([]calendar.Event{accepted})
+	if info == nil || info.Soft || info.AckID != "global" {
+		t.Fatalf("expected hard global reminder after accepting, got %+v", info)
+	}
+	if err := finder.RecordAck(accepted, start, info.AckID); err != nil {
+		t.Fatal(err)
+	}
+	if !ackStore.IsAcked(info.AckEventKey, EventAckID) {
+		t.Fatal("a hard alert completing the alert set should promote to event ack")
+	}
+
+	// Still unanswered at start time: the started nudge fires despite the
+	// earlier global nudge only if global was not nudged. Here it was, so
+	// the started nudge is suppressed like the hard path would be.
+	clock.now = start.Add(time.Minute)
+	if got := finder.FindNext([]calendar.Event{invite}); got != nil {
+		t.Fatalf("started nudge should be suppressed by the global nudge, got %+v", got)
+	}
+}
+
+func TestReminders_UnansweredUsesNudgeIDs(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	finder := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute})
+	start := now.Add(time.Hour)
+	invite := withSelf(makeEventWithReminders("inv", "Invite", start, start.Add(time.Hour), 10), calendar.ResponseNeedsAction)
+
+	rs := finder.Reminders(invite, start)
+	want := []string{nudgePrefix + "10m", nudgePrefix + "global", nudgePrefix + "started"}
+	if len(rs) != len(want) {
+		t.Fatalf("got %d reminders, want %d", len(rs), len(want))
+	}
+	for i, r := range rs {
+		if r.ID != want[i] {
+			t.Errorf("reminder %d ID = %q, want %q", i, r.ID, want[i])
+		}
+	}
+}
+
+func TestFindNext_DeclinedEventDoesNotShadowLaterEvent(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	finder := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute})
+
+	events := []calendar.Event{
+		withSelf(makeEvent("declined", "Declined", now.Add(1*time.Minute), now.Add(31*time.Minute)), calendar.ResponseDeclined),
+		withSelf(makeEvent("accepted", "Accepted", now.Add(4*time.Minute), now.Add(34*time.Minute)), calendar.ResponseAccepted),
+	}
+	info := finder.FindNext(events)
+	if info == nil || info.Event.ID != "accepted" {
+		t.Fatalf("expected reminder for the accepted event, got %+v", info)
+	}
+	if info.Soft {
+		t.Fatal("accepted event must not be soft")
+	}
+}
+
+func TestFindNext_UnansweredInviteIsSoftByDefault(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	finder := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute})
+
+	events := []calendar.Event{
+		withSelf(makeEvent("invite", "Invite", now.Add(4*time.Minute), now.Add(34*time.Minute)), calendar.ResponseNeedsAction),
+	}
+	info := finder.FindNext(events)
+	if info == nil {
+		t.Fatal("expected a reminder for the unanswered invite")
+	}
+	if !info.Soft {
+		t.Fatal("unanswered invite should produce a soft reminder")
+	}
+	if info.ReminderID != "global" {
+		t.Fatalf("ReminderID = %q, want global", info.ReminderID)
+	}
+}
+
+func TestFindNext_UnansweredInviteModes(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	events := []calendar.Event{
+		withSelf(makeEvent("invite", "Invite", now.Add(-1*time.Minute), now.Add(30*time.Minute)), calendar.ResponseNeedsAction),
+	}
+
+	alert := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute, Unanswered: UnansweredAlert})
+	if info := alert.FindNext(events); info == nil || info.Soft {
+		t.Fatalf("alert mode: expected a hard reminder, got %+v", info)
+	}
+
+	ignore := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute, Unanswered: UnansweredIgnore})
+	if info := ignore.FindNext(events); info != nil {
+		t.Fatalf("ignore mode: expected no reminder, got %q", info.ReminderID)
+	}
+	if rs := ignore.Reminders(events[0], now.Add(-1*time.Minute)); len(rs) != 0 {
+		t.Fatalf("ignore mode: expected no reminder states, got %d", len(rs))
+	}
+}
+
+func TestFindNext_TentativeIsTreatedAsAccepted(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	finder := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{WarnBefore: 5 * time.Minute})
+	events := []calendar.Event{
+		withSelf(makeEvent("maybe", "Maybe", now.Add(2*time.Minute), now.Add(32*time.Minute)), calendar.ResponseTentative),
+	}
+	info := finder.FindNext(events)
+	if info == nil || info.Soft {
+		t.Fatalf("tentative should fire a hard reminder, got %+v", info)
+	}
+}
+
+func TestFindNext_PreferenceAndModeCompose(t *testing.T) {
+	now := time.Date(2026, 2, 4, 9, 0, 0, 0, time.UTC)
+	event := makeEvent("evt1", "Unanswered Meeting", now.Add(3*time.Minute), now.Add(time.Hour))
+	event.Attendees = []calendar.Attendee{{Email: "me@example.com", Self: true, ResponseStatus: calendar.ResponseNeedsAction}}
+
+	for _, c := range []struct {
+		name       string
+		preference bool
+		mode       UnansweredMode
+		wantFire   bool
+		wantSoft   bool
+	}{
+		{"on/soft nudges", true, UnansweredSoft, true, true},
+		{"on/alert hard-alerts", true, UnansweredAlert, true, false},
+		{"on/ignore stays silent", true, UnansweredIgnore, false, false},
+		{"off/soft stays silent", false, UnansweredSoft, false, false},
+		{"off/alert stays silent", false, UnansweredAlert, false, false},
+		{"off/ignore stays silent", false, UnansweredIgnore, false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			finder := NewFinder(newMockAckStore(), &mockClock{now: now}, Config{
+				WarnBefore:                 5 * time.Minute,
+				Unanswered:                 c.mode,
+				AlertUnansweredInvitations: func() bool { return c.preference },
+			})
+			got := finder.FindNext([]calendar.Event{event})
+			if (got != nil) != c.wantFire {
+				t.Fatalf("fired = %v, want %v (%+v)", got != nil, c.wantFire, got)
+			}
+			if got != nil && got.Soft != c.wantSoft {
+				t.Errorf("Soft = %v, want %v", got.Soft, c.wantSoft)
+			}
+		})
 	}
 }

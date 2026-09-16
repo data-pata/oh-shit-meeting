@@ -267,3 +267,18 @@ func TestLookbackStart_PreservesLocation(t *testing.T) {
 		t.Errorf("LookbackStart CET 10:00 = %v, want %v", got, want)
 	}
 }
+
+func TestSelfResponseStatus_NormalizesCasing(t *testing.T) {
+	for _, c := range []struct{ raw, want string }{
+		{"NEEDSACTION", ResponseNeedsAction},
+		{"Declined", ResponseDeclined},
+		{"tentative", ResponseTentative},
+		{"somethingElse", "somethingElse"},
+	} {
+		e := Event{Attendees: []Attendee{{Self: true, ResponseStatus: c.raw}}}
+		got, ok := e.SelfResponseStatus()
+		if !ok || got != c.want {
+			t.Errorf("SelfResponseStatus(%q) = %q, %v, want %q", c.raw, got, ok, c.want)
+		}
+	}
+}

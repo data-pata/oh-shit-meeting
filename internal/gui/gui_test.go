@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,7 +175,7 @@ func TestSplitEvents_NilIsAckedIsSafe(t *testing.T) {
 }
 
 func TestTrayIconStatesAreDistinct22PixelPNGs(t *testing.T) {
-	states := []trayIconState{trayHealthy, trayAuthAttention, trayAlert, trayAlertAlternate}
+	states := []trayIconState{trayHealthy, trayAuthAttention, trayAlert, trayAlertAlternate, trayNudge}
 	encoded := make([][]byte, len(states))
 	for i, state := range states {
 		encoded[i] = makeIconPNG(state)
@@ -218,6 +219,7 @@ func TestTrayIconGlyphsCarryStateWithoutColor(t *testing.T) {
 	wantAt(trayAuthAttention, 11, 11, white) // round head of the keyhole
 	wantAt(trayAlert, 11, 10, white)         // exclamation stem
 	wantAt(trayAlertAlternate, 11, 10, red)  // inverted exclamation stem
+	wantAt(trayNudge, 11, 18, white)         // dot of the question mark
 }
 
 // withStubConfig swaps the package-level cfg for the duration of the test
@@ -560,5 +562,155 @@ func TestStateIncludesBackendFetchOutcome(t *testing.T) {
 	}
 	if state.Fetch == nil || state.Fetch.State != "partial" || state.Fetch.Received != 12 || state.Fetch.Included != 9 || !state.Fetch.CanRefresh || !state.Fetch.CompletedAt.Equal(completed) || len(state.Fetch.Calendars) != 2 {
 		t.Fatalf("fetch DTO = %+v", state.Fetch)
+	}
+}
+
+func silenceNotifications(t *testing.T) {
+	t.Helper()
+	c := cfg
+	c.NotifyFn = func(string, string, time.Duration) {}
+	withStubConfig(t, c)
+}
+
+func TestNudges_DismissAndExpiry(t *testing.T) {
+	silenceNotifications(t)
+	now := time.Now()
+	ShowNudge("a", ReminderInfo{Summary: "A", ReminderID: "global", StartTime: now.Add(2 * time.Minute)}, time.Hour)
+	ShowNudge("b", ReminderInfo{Summary: "B", ReminderID: "10m", StartTime: now.Add(time.Minute)}, time.Hour)
+	t.Cleanup(func() { dismissNudge("a"); dismissNudge("b") })
+
+	mu.Lock()
+	ids := []string{}
+	for _, n := range sortedNudgesLocked() {
+		ids = append(ids, n.ID)
+	}
+	mu.Unlock()
+	if len(ids) != 2 || ids[0] != "b" || ids[1] != "a" {
+		t.Fatalf("nudges should stack and sort by start time, got %v", ids)
+	}
+
+	if dismissNudge("missing") {
+		t.Fatal("dismissing an unknown id should report false")
+	}
+	if !dismissNudge("a") {
+		t.Fatal("dismissing a live nudge should report true")
+	}
+
+	expireNudges(now.Add(30 * time.Minute))
+	mu.Lock()
+	stillB := nudges["b"] != nil
+	mu.Unlock()
+	if !stillB {
+		t.Fatal("nudge b should survive until its own deadline")
+	}
+	expireNudges(now.Add(2 * time.Hour))
+	mu.Lock()
+	remaining := len(nudges)
+	mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected all nudges expired, %d remain", remaining)
+	}
+}
+
+func TestHandleDismissNudge(t *testing.T) {
+	silenceNotifications(t)
+	ShowNudge("ev1/10m", ReminderInfo{Summary: "Invite", ReminderID: "10m", StartTime: time.Now().Add(time.Minute)}, time.Minute)
+	t.Cleanup(func() { dismissNudge("ev1/10m") })
+
+	req := httptest.NewRequest(http.MethodPost, "/dismiss-nudge?id=wrong", nil)
+	w := httptest.NewRecorder()
+	handleDismissNudge(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("mismatched id: status = %d, want 409", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/dismiss-nudge?id=ev1%2F10m", nil)
+	w = httptest.NewRecorder()
+	handleDismissNudge(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	mu.Lock()
+	gone := nudges["ev1/10m"] == nil
+	mu.Unlock()
+	if !gone {
+		t.Fatal("nudge should be cleared after dismiss")
+	}
+}
+
+func TestNudgeText(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	info := ReminderInfo{Summary: "Standup", StartTime: now.Add(5 * time.Minute)}
+	if got := nudgeTitle(info); got != "Unanswered invite: Standup" {
+		t.Errorf("title = %q", got)
+	}
+	if got := nudgeBody(info, now); !strings.HasPrefix(got, "starts in 5 minutes (") {
+		t.Errorf("body = %q", got)
+	}
+	late := ReminderInfo{StartTime: now.Add(-3 * time.Minute)}
+	if got := nudgeTitle(late); got != "Unanswered invite" {
+		t.Errorf("empty-summary title = %q", got)
+	}
+	if got := nudgeBody(late, now); !strings.HasPrefix(got, "started 3 minutes ago (") {
+		t.Errorf("late body = %q", got)
+	}
+	long := ReminderInfo{Summary: strings.Repeat("x", 500)}
+	if got := nudgeTitle(long); len(got) > toastLimit+len("…") {
+		t.Errorf("title not truncated: %d chars", len(got))
+	}
+}
+
+func TestHandleState_IncludesNudgesAndSelfResponse(t *testing.T) {
+	start := time.Now().Add(10 * time.Minute)
+	withStubConfig(t, Config{
+		NotifyFn: func(string, string, time.Duration) {},
+		EventsFn: func() []calendar.Event {
+			return []calendar.Event{{
+				ID:        "ev1",
+				Start:     calendar.EventTime{DateTime: start.Format(time.RFC3339)},
+				Attendees: []calendar.Attendee{{Self: true, ResponseStatus: calendar.ResponseDeclined}},
+			}}
+		},
+	})
+	ShowNudge("n1", ReminderInfo{Summary: "Invite", ReminderID: "global", StartTime: start}, time.Minute)
+	t.Cleanup(func() { dismissNudge("n1") })
+
+	req := httptest.NewRequest(http.MethodGet, "/state", nil)
+	w := httptest.NewRecorder()
+	handleState(w, req)
+
+	var got stateDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nudges) != 1 || got.Nudges[0].ID != "n1" || got.Nudges[0].ReminderID != "global" || got.Nudges[0].ExpiresAt.IsZero() {
+		t.Fatalf("nudge missing from state: %+v", got.Nudges)
+	}
+	if len(got.Upcoming) != 1 || got.Upcoming[0].SelfResponse != calendar.ResponseDeclined {
+		t.Fatalf("selfResponse missing from event DTO: %+v", got.Upcoming)
+	}
+}
+
+func TestShowNudge_RepeatIsNoop(t *testing.T) {
+	var toasts atomic.Int32
+	c := cfg
+	c.NotifyFn = func(string, string, time.Duration) { toasts.Add(1) }
+	withStubConfig(t, c)
+	t.Cleanup(func() { dismissNudge("same") })
+
+	ShowNudge("same", ReminderInfo{Summary: "A", StartTime: time.Now()}, time.Hour)
+	mu.Lock()
+	first := nudges["same"].ExpiresAt
+	mu.Unlock()
+	ShowNudge("same", ReminderInfo{Summary: "A again", StartTime: time.Now()}, time.Hour)
+	time.Sleep(20 * time.Millisecond)
+	mu.Lock()
+	n := nudges["same"]
+	mu.Unlock()
+	if n.Info.Summary != "A" || !n.ExpiresAt.Equal(first) {
+		t.Fatal("re-raising a live nudge must not replace it or extend its deadline")
+	}
+	if got := toasts.Load(); got != 1 {
+		t.Fatalf("expected exactly one toast, got %d", got)
 	}
 }

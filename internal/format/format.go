@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+// Minutes renders a duration as prose with minute granularity, for
+// notification text: "under a minute", "1 minute", "12 minutes".
+func Minutes(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	m := int(d.Minutes())
+	switch {
+	case m < 1:
+		return "under a minute"
+	case m == 1:
+		return "1 minute"
+	default:
+		return fmt.Sprintf("%d minutes", m)
+	}
+}
+
 func Duration(d time.Duration) string {
 	if d < 0 {
 		d = -d

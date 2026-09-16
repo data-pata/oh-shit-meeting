@@ -52,25 +52,45 @@ type Attendee struct {
 	Organizer      bool   `json:"organizer,omitempty"`
 }
 
+// Attendee response statuses as reported by the Google Calendar API.
+const (
+	ResponseAccepted    = "accepted"
+	ResponseDeclined    = "declined"
+	ResponseTentative   = "tentative"
+	ResponseNeedsAction = "needsAction"
+)
+
 // SelfResponseStatus returns the authenticated user's response, ignoring the
-// responses of every other attendee.
+// responses of every other attendee. The value is normalised to one of the
+// Response constants so Go and the dashboard compare it the same way.
 func (e Event) SelfResponseStatus() (string, bool) {
 	for _, attendee := range e.Attendees {
 		if attendee.Self {
-			return attendee.ResponseStatus, true
+			return normalizeResponse(attendee.ResponseStatus), true
 		}
 	}
 	return "", false
 }
 
+// normalizeResponse folds API casing onto the Response constants. Unknown
+// values pass through untouched.
+func normalizeResponse(status string) string {
+	for _, known := range []string{ResponseAccepted, ResponseDeclined, ResponseTentative, ResponseNeedsAction} {
+		if strings.EqualFold(status, known) {
+			return known
+		}
+	}
+	return status
+}
+
 func (e Event) IsDeclinedBySelf() bool {
 	status, ok := e.SelfResponseStatus()
-	return ok && strings.EqualFold(status, "declined")
+	return ok && status == ResponseDeclined
 }
 
 func (e Event) IsAwaitingSelfResponse() bool {
 	status, ok := e.SelfResponseStatus()
-	return ok && strings.EqualFold(status, "needsAction")
+	return ok && status == ResponseNeedsAction
 }
 
 type Organizer struct {

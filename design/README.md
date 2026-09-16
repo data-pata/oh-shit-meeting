@@ -17,11 +17,12 @@ than a notification bell.
 | --- | --- | --- | --- |
 | Healthy | Calendar + check | Monochrome, derived from the host theme | None |
 | Authentication attention | Calendar + keyhole/badge | Amber | None |
+| Unanswered invite nudge | Calendar + question mark | Blue | None |
 | Active meeting alert A | Solid calendar + exclamation | Red | Alternate every 500 ms |
 | Active meeting alert B | White calendar on red disc | Red/white inverse | Alternate every 500 ms |
 
-Shape and color both change, so the three states do not depend on color vision
-alone. Keeping the healthy state monochrome also reduces ambient visual noise.
+Shape and color both change, so the states do not depend on color vision
+alone. Severity orders the base states: auth attention over nudge over healthy. Keeping the healthy state monochrome also reduces ambient visual noise.
 
 ## Production notes
 
